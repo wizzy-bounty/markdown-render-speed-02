@@ -13,7 +13,6 @@
 
 const NAMED_ENTITIES = null; // named entities pass through untouched (marked does not decode them)
 
-const RE_NUM_REF = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
 const RE_NUM_REF_OR_STRAY_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 const RE_ESC_TEST = /[&<>"']/;
 const RE_ESC_REPLACE = /[&<>"']/g;
@@ -43,7 +42,7 @@ export function escapeHtml(s, encode) {
 // a bare & not starting a valid reference becomes &amp;. Named references
 // and valid numeric ones pass through unchanged.
 function decodeEntities(s) {
-  if (!RE_NUM_REF.test(s)) return s;
+  if (!s.includes('&')) return s; // no `&` => no numeric ref, no stray amp
   return s.replace(RE_NUM_REF_OR_STRAY_AMP, (m, dec, hex) => {
     if (dec === undefined && hex === undefined) return '&amp;';
     const cp = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
@@ -215,6 +214,18 @@ function trimTrailingBlanks(text) {
   return lines.slice(0, t + 1).join('\n');
 }
 
+// First significant character of a block: the first non-space within
+// the first 3 columns. Every ` {0,3}` block rule needs its marker there;
+// a tab or a 4th space up front means none of them can match. Used as a
+// cheap pre-check so the block dispatch skips regexes that cannot match.
+function firstSigChar(src) {
+  let p = 0;
+  while (p < 3 && src[p] === ' ') p++;
+  const c = src[p];
+  return c === undefined ? '' : c;
+}
+const RE_SETEXT_GATE = /\n {0,3}[=-]/;
+
 class BlockLexer {
   constructor() {
     this.links = Object.create(null);
@@ -327,12 +338,22 @@ class BlockLexer {
   }
 
   trySpace(src) {
+    const c0 = src[0];
+    if (c0 !== ' ' && c0 !== '\t' && c0 !== '\n') return null;
     const m = RE_NEWLINE.exec(src);
     if (m && m[0].length > 0) return { type: 'space', raw: m[0] };
     return null;
   }
 
   tryCode(src) {
+    // Indented code needs 4 spaces or a tab within the first 4 columns.
+    const c0 = src[0];
+    if (c0 === '\t') { /* ok */ }
+    else if (c0 === ' ') {
+      let q = 0;
+      while (q < 4 && src[q] === ' ') q++;
+      if (q !== 4 && src[q] !== '\t') return null;
+    } else return null;
     const m = RE_INDENTED_CODE.exec(src);
     if (!m) return null;
     const raw = trimTrailingBlanks(m[0]);
@@ -341,6 +362,8 @@ class BlockLexer {
   }
 
   tryFences(src) {
+    const fc = firstSigChar(src);
+    if (fc !== '`' && fc !== '~') return null;
     const m = RE_FENCES.exec(src);
     if (!m) return null;
     const raw = m[0];
@@ -350,7 +373,7 @@ class BlockLexer {
     if (indentMatch) {
       const ind = indentMatch[1];
       text = text.split('\n').map((line) => {
-        const lead = /^ +/.exec(line);
+        const lead = /^\s+/.exec(line);
         if (!lead) return line;
         return line.slice(Math.min(lead[0].length, ind.length));
       }).join('\n');
@@ -360,6 +383,7 @@ class BlockLexer {
   }
 
   tryHeading(src) {
+    if (firstSigChar(src) !== '#') return null;
     const m = RE_ATX.exec(src);
     if (!m) return null;
     let text = m[2].trim();
@@ -374,12 +398,15 @@ class BlockLexer {
   }
 
   tryHr(src) {
+    const fc = firstSigChar(src);
+    if (fc !== '-' && fc !== '_' && fc !== '*') return null;
     const m = RE_HR.exec(src);
     if (!m) return null;
     return { type: 'hr', raw: m[0].replace(/\n$/, '') };
   }
 
   tryHtml(src) {
+    if (firstSigChar(src) !== '<') return null;
     const m = RE_HTML_BLOCK.exec(src);
     if (!m) return null;
     const raw = trimTrailingBlanks(m[0]);
@@ -387,6 +414,7 @@ class BlockLexer {
   }
 
   tryDef(src) {
+    if (firstSigChar(src) !== '[') return null;
     const m = RE_DEF.exec(src);
     if (!m) return null;
     const label = m[1];
@@ -400,6 +428,16 @@ class BlockLexer {
   }
 
   tryTable(src) {
+    // A table needs a header line and, right after it, a delimiter row
+    // whose first significant char is `|`, `:` or `-`.
+    if (src[0] === '\n') return null;
+    const nl = src.indexOf('\n');
+    if (nl === -1) return null;
+    let q = nl + 1;
+    let sp = 0;
+    while (sp < 3 && src[q] === ' ') { q++; sp++; }
+    const dc = src[q];
+    if (dc !== '|' && dc !== ':' && dc !== '-') return null;
     const m = RE_TABLE.exec(src);
     if (!m || !RE_TABLE_DELIM.test(m[2])) return null;
     const headerCells = splitTableRow(m[1]);
@@ -430,6 +468,8 @@ class BlockLexer {
   }
 
   trySetext(src) {
+    // The underline (`===`/`---`) must appear after a newline.
+    if (!RE_SETEXT_GATE.test(src)) return null;
     const m = buildSetextRegex().exec(src);
     if (!m) return null;
     const text = m[1].trim();
@@ -509,8 +549,15 @@ const RE_TAB_GLOBAL = /\t/g;
 const RE_SETEXT_LINE = /^ {0,3}(?:=+|-+) *$/;
 const RE_LIST_NESTING = /^ {1,4}(?=( {4})*[^ ])/g;
 
+const _listItemReCache = new Map();
 function listItemRegex(bulletPat) {
-  return new RegExp(`^( {0,3}${bulletPat})((?:[ \t][^\\n]*)?(?:\\n|$))`);
+  // Cached: one compiled regex per bullet shape (a handful exist).
+  let re = _listItemReCache.get(bulletPat);
+  if (!re) {
+    re = new RegExp(`^( {0,3}${bulletPat})((?:[ \t][^\\n]*)?(?:\\n|$))`);
+    _listItemReCache.set(bulletPat, re);
+  }
+  return re;
 }
 // The "a line that would start another block" tests take the item's content
 // indent, clamped the way marked's cached regexes do: at most 3, and one
@@ -519,34 +566,69 @@ function listItemRegex(bulletPat) {
 function clampIndent(indent) {
   return Math.max(0, Math.min(3, indent - 1));
 }
+const _nextBulletRegexCache = [];
 function nextBulletRegex(indent) {
-  return new RegExp(`^ {0,${clampIndent(indent)}}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))`);
+  // Cached per clamped indent (0..3): built once, reused for
+  // every list item instead of recompiling per item.
+  const c = clampIndent(indent);
+  return _nextBulletRegexCache[c] ??= new RegExp(`^ {0,${clampIndent(indent)}}(?:[*+-]|\\d{1,9}[.)])((?:[ \t][^\\n]*)?(?:\\n|$))`);
 }
+const _hrRegexCache = [];
 function hrRegex(indent) {
-  return new RegExp(`^ {0,${clampIndent(indent)}}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)`);
+  // Cached per clamped indent (0..3): built once, reused for
+  // every list item instead of recompiling per item.
+  const c = clampIndent(indent);
+  return _hrRegexCache[c] ??= new RegExp(`^ {0,${clampIndent(indent)}}((?:-[ \t]*){3,}|(?:_[ \t]*){3,}|(?:\\*[ \t]*){3,})(?:\\n+|$)`);
 }
+const _fencesBeginRegexCache = [];
 function fencesBeginRegex(indent) {
-  return new RegExp(`^ {0,${clampIndent(indent)}}(?:\`\`\`|~~~)`);
+  // Cached per clamped indent (0..3): built once, reused for
+  // every list item instead of recompiling per item.
+  const c = clampIndent(indent);
+  return _fencesBeginRegexCache[c] ??= new RegExp(`^ {0,${clampIndent(indent)}}(?:\`\`\`|~~~)`);
 }
+const _headingBeginRegexCache = [];
 function headingBeginRegex(indent) {
-  return new RegExp(`^ {0,${clampIndent(indent)}}#{1,6}(?:\\s|$)`);
+  // Cached per clamped indent (0..3): built once, reused for
+  // every list item instead of recompiling per item.
+  const c = clampIndent(indent);
+  return _headingBeginRegexCache[c] ??= new RegExp(`^ {0,${clampIndent(indent)}}#{1,6}(?:\\s|$)`);
 }
+const _htmlBeginRegexCache = [];
 function htmlBeginRegex(indent) {
-  return new RegExp(`^ {0,${clampIndent(indent)}}(?:</?(?:${RE_HTML_BLOCK_TAG})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i');
+  // Cached per clamped indent (0..3): built once, reused for
+  // every list item instead of recompiling per item.
+  const c = clampIndent(indent);
+  return _htmlBeginRegexCache[c] ??= new RegExp(`^ {0,${clampIndent(indent)}}(?:</?(?:${RE_HTML_BLOCK_TAG})(?: +|$|/?>)|<(?:(?:script|pre|style|textarea)(?:[\\s>]|$)|!--)|<\\?|<![A-Za-z]|<!\\[CDATA\\[)`, 'i');
 }
+const _blockquoteBeginRegexCache = [];
 function blockquoteBeginRegex(indent) {
-  return new RegExp(`^ {0,${clampIndent(indent)}}>`);
+  // Cached per clamped indent (0..3): built once, reused for
+  // every list item instead of recompiling per item.
+  const c = clampIndent(indent);
+  return _blockquoteBeginRegexCache[c] ??= new RegExp(`^ {0,${clampIndent(indent)}}>`);
 }
 
 // The blockquote regex: a run of lines, each either a `>` line (whose
 // content may itself span paragraph-continuation lines) or any line at all
 // (a lazy line, swallowed by the paragraph match of the `>` line above it).
+let _blockquoteRe = null;
 function blockquoteRegex() {
-  const para = RE_PARA.source.slice(1); // paragraph pattern without ^
-  return new RegExp(`^( {0,3}> ?(?:(?![ \\t]*(?:\\n|$))(${para})|[^\\n]*)(?:\\n|$))+`);
+  // Compiled once: the pattern never changes, and tryBlockquote
+  // runs for every block in the document.
+  if (!_blockquoteRe) {
+    const para = RE_PARA.source.slice(1); // paragraph pattern without ^
+    _blockquoteRe = new RegExp(`^( {0,3}> ?(?:(?![ \\t]*(?:\\n|$))(${para})|[^\\n]*)(?:\\n|$))+`);
+  }
+  return _blockquoteRe;
 }
 
 function tryBlockquote(lexer, src) {
+  // Fast reject: the regex needs `>` within the first 3 columns; most
+  // blocks are not blockquotes, so skip the giant regex entirely.
+  let p = 0;
+  while (p < 3 && src[p] === ' ') p++;
+  if (src[p] !== '>') return null;
   const m = blockquoteRegex().exec(src);
   if (!m) return null;
   const raw0 = m[0].replace(/\n$/, '');
@@ -611,6 +693,9 @@ function tryBlockquote(lexer, src) {
 }
 
 function tryList(lexer, src) {
+  // A list starts with a bullet or an ordered marker within 3 columns.
+  const fc = firstSigChar(src);
+  if (fc !== '*' && fc !== '+' && fc !== '-' && !(fc >= '0' && fc <= '9')) return null;
   const start = RE_LIST_START.exec(src);
   if (!start) return null;
   const full = src;
@@ -633,10 +718,11 @@ function tryList(lexer, src) {
     if (!m || RE_HR.test(rest)) break;
     const itemStart = offset();
     rest = rest.substring(m[0].length);
-    let g = m[2].split('\n', 1)[0];
+    let g = m[2].endsWith('\n') ? m[2].slice(0, -1) : m[2];
     const bulletWidth = m[1].length;
     let content = g.replace(RE_LEADING_SPACE_TAB, (v) => expandTabs(v, bulletWidth));
-    let nextLine = rest.split('\n', 1)[0];
+    const _nl0 = rest.indexOf('\n');
+    let nextLine = _nl0 === -1 ? rest : rest.slice(0, _nl0);
     let emptyFirst = !content.trim();
     let indent = 0;
     let d;
@@ -661,10 +747,21 @@ function tryList(lexer, src) {
       const htmlRe = htmlBeginRegex(indent);
       const bqRe = blockquoteBeginRegex(indent);
       while (rest) {
-        const line = rest.split('\n', 1)[0];
+        const _nl = rest.indexOf('\n');
+        const line = _nl === -1 ? rest : rest.slice(0, _nl);
         nextLine = line;
-        const expanded = line.replace(RE_LEADING_SPACE_TAB, (v) => expandTabs(v, 0));
-        if (fencesRe.test(line) || headingRe.test(line) || htmlRe.test(line) || bqRe.test(line) || nextBullet.test(line) || hrRe.test(line)) break;
+        // Tab-expand only when the line starts with space/tab; the
+        // replace is a no-op otherwise.
+        const expanded = (line[0] === ' ' || line[0] === '\t')
+          ? line.replace(RE_LEADING_SPACE_TAB, (v) => expandTabs(v, 0)) : line;
+        // Every interrupt pattern starts with one of these chars within
+        // the first 3 columns; anything else cannot interrupt the item.
+        let _p = 0;
+        while (_p < 3 && line[_p] === ' ') _p++;
+        const _fc = line[_p];
+        if (_fc === '`' || _fc === '~' || _fc === '#' || _fc === '<' || _fc === '>' || _fc === '*' || _fc === '+' || _fc === '-' || _fc === '_' || (_fc >= '0' && _fc <= '9')) {
+          if (fencesRe.test(line) || headingRe.test(line) || htmlRe.test(line) || bqRe.test(line) || nextBullet.test(line) || hrRe.test(line)) break;
+        }
         if (expanded.search(RE_NON_SPACE) >= indent || !line.trim()) {
           d += '\n' + expanded.slice(indent);
         } else {
@@ -761,11 +858,35 @@ const RE_END_A_TAG = /^<\/a>/i;
 const RE_START_PRE_TAG = /^<(pre|code|kbd|script)(\s|>)/i;
 const RE_END_PRE_TAG = /^<\/(pre|code|kbd|script)(\s|>)/i;
 const RE_EMAIL_LOCAL = /[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]/;
-const RE_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]{1,31}:\/\//;
+// The character class marked's gfm `text` rule uses to spot an email
+// start (`[local]+@`): same set minus `^`.
+const RE_TEXT_LOCAL = /[A-Za-z0-9.!#$%&'*+\/=?_`{|}~-]/;
 const RE_URL_BACKPEDAL = /(?:[^?!.,:;*_'"~()&]+|\([^)]*\)|&(?![a-zA-Z0-9]+;$)|[?!.,:;*_'"~)]+(?!$))+/;
-const RE_URL_EMAIL = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/;
-// Same email, without the trailing (?![\w-]) lookahead: the maximal match.
-const RE_EMAIL_NOLOOK = /^[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+/;
+// Sticky variants for tryUrlAt: they match at an exact position in the
+// source without slicing the rest of the string. (The old code sliced
+// `src.slice(pos)` for EVERY letter position — O(n) allocation per call,
+// O(n^2) per paragraph — just to test www./scheme/email.)
+const RE_WWW_STICKY = /www\.(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*/y;
+const RE_HTTP_STICKY = /(?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*/y;
+const RE_EMAIL_NOLOOK_STICKY = /[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+/y;
+const RE_URL_EMAIL_STICKY = /[A-Za-z0-9._+-]+@[a-zA-Z0-9-_]+(?:\.[a-zA-Z0-9-_]*[a-zA-Z0-9])+(?![\w-])/y;
+const RE_XMPP_PATH_STICKY = /\/[A-Za-z0-9@.]+/y;
+// The email local-part set (narrow: alnum, `.`, `_`, `+`, `-`): an email
+// can only START where the previous char is outside this set, otherwise
+// the match would start earlier and that earlier position was tried
+// first. (The wider text-rule set must NOT be used here: `!a@b.co`
+// links `a@b.co` even though `!` is a wide-local char.)
+const RE_EMAIL_LOCAL_NARROW = /[A-Za-z0-9._+-]/;
+// Char-code tests for the email local-part set and alphanumerics:
+// a regex .test() per letter position was measurable, these are not.
+function isEmailLocalNarrow(c) {
+  const k = c.charCodeAt(0);
+  return (k >= 48 && k <= 57) || (k >= 65 && k <= 90) || (k >= 97 && k <= 122) || c === '.' || c === '_' || c === '+' || c === '-';
+}
+function isAlnumCh(c) {
+  const k = c.charCodeAt(0);
+  return (k >= 48 && k <= 57) || (k >= 65 && k <= 90) || (k >= 97 && k <= 122);
+}
 const RE_BR = /^( {2,}|\\)\n(?!\s*$)[ \t]*/;
 const RE_WS = /\s/;
 const RE_PUNCT_TEST = /[\p{P}\p{S}]/u;
@@ -780,30 +901,6 @@ function isPunct(ch) { return ch !== undefined && RE_PUNCT_TEST.test(ch); }
 // non-ASCII punctuation are NOT escapable.
 const RE_ASCII_PUNCT = /[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~]/;
 function isAsciiPunct(ch) { return ch !== undefined && RE_ASCII_PUNCT.test(ch); }
-
-// Flanking of a delimiter run: `before` is the char before the run,
-// `after` the char after it. `punct` decides which chars count as
-// punctuation (for `~` the tilde itself does not).
-function flanking(before, after, punct) {
-  const beforeWS = before === undefined || before === '\n' || isSpace(before);
-  const afterWS = after === undefined || after === '\n' || isSpace(after);
-  const beforePunct = punct(before);
-  const afterPunct = punct(after);
-  const left = !afterWS && (!afterPunct || beforeWS || beforePunct);
-  const right = !beforeWS && (!beforePunct || afterWS || afterPunct);
-  return { left, right, beforePunct, afterPunct };
-}
-
-function canOpenDelim(char, f) {
-  if (char === '*') return f.left;
-  if (char === '_') return f.left && (!f.right || f.beforePunct);
-  return f.left;
-}
-function canCloseDelim(char, f) {
-  if (char === '*') return f.right;
-  if (char === '_') return f.right && (!f.left || f.afterPunct);
-  return f.right;
-}
 
 // Parse a title + closing paren after a destination that ends at `j`.
 // Returns {title, end} or null.
@@ -881,8 +978,12 @@ function parseLinkDestination(src, i) {
 
 // Scan for the `]` closing a link label that starts at `src[i]` (`[`).
 // Returns the index of the matching `]` or -1. Nested brackets count;
-// code spans are skipped.
-function findLabelEnd(src, i) {
+// code spans are skipped. `literalFirst` selects the fallback reading
+// of marked's label regex: a run of 2+ backticks immediately before `]`
+// is label text (`` ``+(?=\]) ``) instead of the opening of a code span
+// whose closer is the next backtick run anywhere (the default reading
+// tries the code-span alternative first).
+function findLabelEnd(src, i, literalFirst = false) {
   let depth = 0;
   let j = i;
   const n = src.length;
@@ -892,10 +993,15 @@ function findLabelEnd(src, i) {
     if (ch === '`') {
       let k = j;
       while (k < n && src[k] === '`') k++;
-      // A code span inside a label closes at the next backtick run of any
-      // length (marked's label regex allows unequal runs, e.g. ``x`). A
-      // run with no later run is literal only when it is 2+ backticks
-      // right before `]`; otherwise the label cannot close at all.
+      // A run of 2+ backticks immediately before `]` is label text, not
+      // a code span (marked's label regex `` ``+(?=\]) `` alternative).
+      // In the default reading the code-span alternative is tried first,
+      // so the run only counts as label text when no later backtick run
+      // closes a code span; in the fallback reading it always does.
+      // Only otherwise does a code span inside a label close at the next
+      // backtick run of any length (marked's label regex allows unequal
+      // runs, e.g. ``x`).
+      if (literalFirst && k - j >= 2 && src[k] === ']') { j = k; continue; }
       let m = k;
       let found = -1;
       while (m < n) {
@@ -906,10 +1012,7 @@ function findLabelEnd(src, i) {
         }
         m++;
       }
-      if (found === -1) {
-        if (k - j >= 2 && src[k] === ']') { j = k; continue; }
-        return -1;
-      }
+      if (found === -1) return -1;
       j = found;
       continue;
     }
@@ -941,61 +1044,140 @@ function labelHasRunawayTag(src, labelStart, labelEnd) {
 }
 
 // Try to form a link/image from a `[` at `src[i]`. `image` is true when the
-// `[` is preceded by `!`. Returns {node, end} or null (not a link: the `[`
-// stays literal text).
+// `[` is preceded by `!`. Returns {node, end}, {literal, end} (a literal
+// `[`/`!` — a token boundary, as marked's nolink), or null (not a link
+// and no token boundary: the `[` stays in the pending text).
+// Mirrors marked's two steps: link() first (inline link, label regex
+// backtracking over its two backtick readings), then reflink().
 function tryLink(src, i, image, lexer) {
-  const labelEnd = findLabelEnd(src, i);
-  if (labelEnd === -1) return null;
-  const label = src.slice(i + 1, labelEnd);
-  if (labelHasRunawayTag(src, i + 1, labelEnd)) return null;
-  const after = labelEnd + 1;
-  // Inline link: (destination "title"). When the parenthesised form does
-  // not parse, the reference forms are still tried on the label itself.
-  if (src[after] === '(') {
-    const dest = parseLinkDestination(src, after);
-    if (dest) {
-      let href = dest.href;
-      // A destination starting with `<` must end with an unescaped `>`;
-      // otherwise the inline form fails and the shortcut is tried.
-      if (href.startsWith('<')) {
-        if (!href.endsWith('>')) return shortcutLink(src, i, labelEnd, label, image, lexer);
+  // Candidate label ends: code-span-first, then literal-first.
+  // (A lazy second scan was tried and reverted: bounding the backtick
+  // check needs an unbounded indexOf, costlier than rescanning the
+  // usually-short label.)
+  const ends = [];
+  const e1 = findLabelEnd(src, i, false);
+  if (e1 !== -1) ends.push(e1);
+  const e2 = findLabelEnd(src, i, true);
+  if (e2 !== -1 && e2 !== e1) ends.push(e2);
+  // Phase A — inline link: the label regex backtracks over readings
+  // until `](` + a destination parses.
+  for (const labelEnd of ends) {
+    const label = src.slice(i + 1, labelEnd);
+    if (src[labelEnd + 1] !== '(') continue;
+    const dest = parseLinkDestination(src, labelEnd + 1);
+    if (!dest) continue;
+    let href = dest.href;
+    let ok = true;
+    // A destination starting with `<` must end with an unescaped `>`;
+    // otherwise the inline form fails.
+    if (href.startsWith('<')) {
+      if (!href.endsWith('>')) ok = false;
+      else {
         const base = href.slice(0, -1);
         let k = base.length;
         while (k > 0 && base[k - 1] === '\\') k--;
-        if ((href.length - k) % 2 === 0) return shortcutLink(src, i, labelEnd, label, image, lexer);
-        href = href.slice(1, -1);
+        if ((href.length - k) % 2 === 0) ok = false;
+        else href = href.slice(1, -1);
       }
-      return makeLink(src, i, labelEnd, label, { href: unescapeBackslash(href), title: dest.title ? unescapeBackslash(dest.title) : '' }, dest.end, image, lexer);
     }
-    return shortcutLink(src, i, labelEnd, label, image, lexer);
+    // The inline shape matched: this is the label. A runaway tag, a bad
+    // angle destination, or a label holding a link all fail link() and
+    // leave only the reflink step (no further label backtracking).
+    if (!ok || labelHasRunawayTag(src, i + 1, labelEnd)) {
+      return tryReflink(src, i, ends, image, lexer);
+    }
+    const made = makeLink(src, i, labelEnd, label, { href: unescapeBackslash(href), title: dest.title ? unescapeBackslash(dest.title) : '' }, dest.end, image, lexer);
+    if (made) return made;
+    return tryReflink(src, i, ends, image, lexer);
   }
-  // Reference link: [label][ref], [label][], or shortcut [label].
-  if (src[after] === '[') {
-    let refEnd = -1;
-    let ref = label;
-    if (src[after + 1] === ']') {
-      refEnd = after + 1;
-    } else {
-      let j = after + 1;
-      while (j < src.length) {
-        if (src[j] === '\\') { j += 2; continue; }
-        if (src[j] === ']' || src[j] === '[' || src[j] === '\n') break;
-        j++;
+  // Phase B — reflink / nolink.
+  return tryReflink(src, i, ends, image, lexer);
+}
+
+// Reference link: [label][ref], [label][], or shortcut [label]; then
+// marked's nolink on the `be` label (which allows backticks, so it can
+// match where the label regex cannot).
+// Mirrors marked's reflink(): the reflink regex is tried FIRST, over all
+// backtrackings of the label, and only when it matches nowhere does the
+// nolink regex run. So a `[label][ref]` whose ref is undefined is just a
+// literal `[` token (nolink is never tried after it), and a label with a
+// runaway tag rejects the link outright (marked's Be check).
+function tryReflink(src, i, ends, image, lexer) {
+  if (ends.length > 0) {
+    // Pass 1 — reflink over every candidate label end. A `[label][ref]`
+    // that closes syntactically beats any shortcut, whatever the
+    // candidate order: marked's lazy label regex backtracks until
+    // `][ref]` matches, and only then falls through to nolink.
+    let reflinkMatched = false;
+    for (const labelEnd of ends) {
+      const label = src.slice(i + 1, labelEnd);
+      const after = labelEnd + 1;
+      if (src[after] !== '[') continue;
+      let refEnd = -1;
+      let ref = label;
+      if (src[after + 1] === ']') {
+        refEnd = after + 1;
+      } else {
+        let j = after + 1;
+        while (j < src.length) {
+          if (src[j] === '\\') { j += 2; continue; }
+          if (src[j] === ']' || src[j] === '[' || src[j] === '\n') break;
+          j++;
+        }
+        if (j < src.length && src[j] === ']') {
+          refEnd = j;
+          ref = src.slice(after + 1, j);
+        }
       }
-      if (j < src.length && src[j] === ']') {
-        refEnd = j;
-        ref = src.slice(after + 1, j);
-      }
+      if (refEnd === -1) continue;
+      reflinkMatched = true;
+      if (labelHasRunawayTag(src, i + 1, labelEnd)) continue;
+      const target = lexer.links[normalizeLabel(ref)];
+      if (!target) return { literal: image ? '!' : '[', end: i + 1 };
+      const made = makeLink(src, i, labelEnd, label, target, refEnd + 1, image, lexer);
+      if (made) return made;
+      // Label holds a link: marked's De refuses it; try the next
+      // reading (a longer label holds the same link, so this normally
+      // just falls through to the null below).
     }
-    if (refEnd === -1) {
-      // No closing bracket: try the shortcut form on the label itself.
-      return shortcutLink(src, i, labelEnd, label, image, lexer);
-    }
-    const target = lexer.links[normalizeLabel(ref)];
-    if (!target) return { literal: image ? '!' : '[', end: i + 1 };
-    return makeLink(src, i, labelEnd, label, target, refEnd + 1, image, lexer);
+    if (reflinkMatched) return null;
+    // Pass 2 — no `[label][ref]` matched anywhere: marked's nolink may
+    // still match on the shorter `be` label (backticks the label regex
+    // cannot span), or yield the literal `[` boundary.
+    const nolink = tryNolink(src, i, image, lexer);
+    if (nolink) return nolink;
+    return null;
   }
-  return shortcutLink(src, i, labelEnd, label, image, lexer);
+  return tryNolink(src, i, image, lexer);
+}
+
+// marked's nolink: `[ref]` where ref is up to 1999 chars of (escaped
+// char | any char except `[`, `]`, `\`), not empty/whitespace-only.
+// A defined ref makes a shortcut link; otherwise the `[` is a literal
+// 1-character text token (a token boundary, e.g. `www.` can link after
+// it). Returns null when no `]` closes such a ref.
+function tryNolink(src, i, image, lexer) {
+  let j = i + 1;
+  const n = src.length;
+  let k = j;
+  while (k < n && (src[k] === ' ' || src[k] === '\t' || src[k] === '\n')) k++;
+  if (k < n && src[k] === ']') return null;
+  while (j < n) {
+    const ch = src[j];
+    if (ch === '\\') { j += 2; continue; }
+    if (ch === '[' || ch === ']') break;
+    j++;
+  }
+  if (j >= n || src[j] !== ']' || j - (i + 1) > 1999) return null;
+  const ref = src.slice(i + 1, j);
+  // marked's Be check applies to the nolink ref as well: a tag/autolink
+  // running past the `]` rejects the shortcut outright.
+  if (labelHasRunawayTag(src, i + 1, j)) return null;
+  let end = j + 1;
+  if (src[j + 1] === '[' && src[j + 2] === ']') end = j + 3;
+  const target = lexer.links[normalizeLabel(ref)];
+  if (!target) return { literal: image ? '!' : '[', end: i + 1 };
+  return makeLink(src, i, j, ref, target, end, image, lexer);
 }
 
 function shortcutLink(src, i, labelEnd, label, image, lexer) {
@@ -1012,7 +1194,7 @@ function makeLink(src, i, labelEnd, label, target, end, image, lexer) {
   const savedEmitted = state.linkEmitted;
   state.inLink = true;
   state.linkEmitted = false;
-  const labelTokens = parseInline(label, lexer);
+  const labelTokens = parseInline(label, lexer, true);
   const hadLink = state.linkEmitted;
   state.linkEmitted = savedEmitted;
   state.inLink = savedInLink;
@@ -1028,95 +1210,273 @@ function makeLink(src, i, labelEnd, label, target, end, image, lexer) {
   };
 }
 
-// Process the delimiter stack into em/strong/del nodes (CommonMark
-// appendix A, phase 2). `nodes` is mutated in place; delimiters reference
-// their node objects.
-function processEmphasis(nodes, delims) {
-  for (let ci = 0; ci < delims.length; ci++) {
-    const closer = delims[ci];
-    if (!closer.active || closer.len === 0 || !closer.canClose) continue;
-    while (closer.len > 0) {
-      // Find the nearest earlier opener of the same kind.
-      let opener = null;
-      let openerIdx = -1;
-      for (let oi = ci - 1; oi >= 0; oi--) {
-        const o = delims[oi];
-        if (!o.active || o.len === 0 || o.char !== closer.char || !o.canOpen) continue;
-        if (closer.char === '~') {
-          if (o.len !== closer.len) continue;
-        } else if ((o.canClose && o.canOpen) || (closer.canClose && closer.canOpen)) {
-          // The rule of three: when either side can both open and close,
-          // the two runs' lengths must not sum to a multiple of 3, UNLESS
-          // both lengths are themselves multiples of 3.
-          if ((o.len + closer.len) % 3 === 0 && (o.len % 3 !== 0 || closer.len % 3 !== 0)) continue;
-        }
-        opener = o;
-        openerIdx = oi;
-        break;
-      }
-      if (!opener) break;
-      const use = closer.char === '~' ? closer.len : (opener.len >= 2 && closer.len >= 2 ? 2 : 1);
-      const type = closer.char === '~' ? 'del' : (use === 2 ? 'strong' : 'em');
-      const openerNode = opener.node;
-      const closerNode = closer.node;
-      const oi = nodes.indexOf(openerNode);
-      const cj = nodes.indexOf(closerNode);
-      // Trim the used delimiters off their text nodes.
-      openerNode.text = openerNode.text.slice(0, openerNode.text.length - use);
-      openerNode.raw = openerNode.text;
-      closerNode.text = closerNode.text.slice(use);
-      closerNode.raw = closerNode.text;
-      opener.len -= use;
-      closer.len -= use;
-      if (opener.len === 0) opener.active = false;
-      if (closer.len === 0) closer.active = false;
-      // Delimiters between opener and closer are now inside the new node.
-      for (let k = openerIdx + 1; k < ci; k++) {
-        const d = delims[k];
-        if (d.node !== openerNode && d.node !== closerNode && nodes.indexOf(d.node) > oi && nodes.indexOf(d.node) < cj) d.active = false;
-      }
-      const middle = nodes.slice(oi + 1, cj);
-      const newNode = { type, raw: '', text: '', tokens: middle };
-      const before = nodes.slice(0, oi);
-      const after = nodes.slice(cj + 1);
-      if (openerNode.text.length > 0) before.push(openerNode);
-      if (closerNode.text.length > 0) after.unshift(closerNode);
-      nodes.length = 0;
-      nodes.push(...before, newNode, ...after);
-      if (closer.char === '~') break; // del consumes the whole run at once
-    }
+// ---------------------------------------------------------------------------
+// Eager emStrong/del, ported from marked 18.1.3's GFM inline rules.
+// marked never builds a delimiter stack: from a delimiter run it scans
+// forward for a closer, and the closer search runs on a MASKED source in
+// which link, code-span and HTML contents are replaced by `[aaa...]`, so
+// their `*`/`_`/`~` can never close an outer span. `~` is NOT punctuation
+// for the `*` rules, but it IS punctuation for the `_` rules.
+// ---------------------------------------------------------------------------
+
+const RE_EM_PUNCT_OR_SPACE = /^((?![*_])[\s\p{P}\p{S}])/u;
+// LDelim (gfm: punctuation excludes `~`).
+const RE_EM_LDELIM = /^(?:\*+(?:((?!\*)(?!~)[\p{P}\p{S}])|([^\s*]))?)|^_+(?:((?!_)(?!~)[\p{P}\p{S}])|([^\s_]))?/u;
+// RDelim for `*` (gfm): groups 1..6 are the closer runs. Alternatives
+// 3/4 cannot close (their runs extend the opener budget `m`); 5/6 feed
+// the rule-of-three excess `f`.
+const RE_EM_RDELIM_AST = /^[^_*]*?__[^_*]*?\*[^_*]*?(?=__)|[^*]+(?=[^*])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?=[\s]|$)|(?:[^\s\p{P}\p{S}]|~)(\*+)(?!\*)(?=(?!~)[\s\p{P}\p{S}]|$)|(?!\*)(?!~)[\s\p{P}\p{S}](\*+)(?=(?:[^\s\p{P}\p{S}]|~))|[\s](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?!\*)(?!~)[\p{P}\p{S}](\*+)(?!\*)(?=(?!~)[\p{P}\p{S}])|(?:[^\s\p{P}\p{S}]|~)(\*+)(?=(?:[^\s\p{P}\p{S}]|~))/gu;
+// RDelim for `_` (gfm: `~` DOES count as punctuation here).
+const RE_EM_RDELIM_UND = /^[^_*]*?\*\*[^_*]*?_[^_*]*?(?=\*\*)|[^_]+(?=[^_])|(?!_)[\p{P}\p{S}](_+)(?=[\s]|$)|[^\s\p{P}\p{S}](_+)(?!_)(?=[\s\p{P}\p{S}]|$)|(?!_)[\s\p{P}\p{S}](_+)(?=[^\s\p{P}\p{S}])|[\s](_+)(?!_)(?=[\p{P}\p{S}])|(?!_)[\p{P}\p{S}](_+)(?!_)(?=[\p{P}\p{S}])/gu;
+// del LDelim / RDelim (gfm).
+const RE_DEL_LDELIM = /^~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/u;
+// Sticky LDelim variants: match the opener run at an exact position
+// without slicing the rest of the paragraph (the slice made every
+// failed delimiter attempt O(n)).
+const RE_EM_LDELIM_STICKY = /(?:\*+(?:((?!\*)(?!~)[\p{P}\p{S}])|([^\s*]))?)|(?:_+(?:((?!_)(?!~)[\p{P}\p{S}])|([^\s_]))?)/yu;
+const RE_DEL_LDELIM_STICKY = /~~?(?:((?!~)[\p{P}\p{S}])|[^\s~])/yu;
+const RE_DEL_RDELIM = /^[^~]+(?=[^~])|(?!~)[\p{P}\p{S}](~~?)(?=[\s]|$)|[^\s\p{P}\p{S}](~~?)(?!~)(?=[\s\p{P}\p{S}]|$)|(?!~)[\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])|[\s](~~?)(?!~)(?=[\p{P}\p{S}])|(?!~)[\p{P}\p{S}](~~?)(?!~)(?=[\p{P}\p{S}])|[^\s\p{P}\p{S}](~~?)(?=[^\s\p{P}\p{S}])/gu;
+// Masking regexes (marked's anyPunctuationOutsideCode / blockSkip).
+const RE_MASK_ANY_PUNCT = /(`+)(?:[^`]|[^`][\s\S]*?[^`])\1(?!`)|`+|\\([\p{P}\p{S}])/gu;
+const RE_MASK_BLOCKSKIP = /\[(?:[^\[\]`]|(?<a>`+)[^`]+\k<a>(?!`))*?\]\((?:\\[\s\S]|[^\\\(\)]|\((?:\\[\s\S]|[^\\\(\)])*\))*\)|(?<!`)()(?<b>`+)[^`]+\k<b>(?!`)|<(?! )[^<>]*?>/g;
+// Label / ref fragments for the reflink search used while masking.
+const RE_BRACKETED = /\[(?:\\[\s\S]|[^\[\]\\])*\]/;
+const RE_MASK_REF = /(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}/;
+const RE_MASK_LABEL = /(?:[^\[\]\\`]*(?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\]))){0,999}?[^\[\]\\`]*?/;
+const RE_MASK_REFLINK_SEARCH = new RegExp('!?\\[(' + RE_MASK_LABEL.source + ')\\]\\[(' + RE_MASK_REF.source + ')\\]|!?\\[(' + RE_MASK_REF.source + ')\\](?:\\[\\])?(?!\\()', 'g');
+// Inline-link shape, for linkInText (marked's link rule).
+const RE_LINK_TEST = /^!?\[((?:\[(?:\[(?:\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|[^\[\]\\])*\]|\\[\s\S]|`+(?!`)[^`]*?`+(?!`)|``+(?=\])|[^\[\]\\`])*?)\]\([ \t\n]*(<(?:\\.|[^\n<>\\])+>|[^ \t\n\x00-\x1f]+|(?=\)))(?:(?:[ \t]+(?:\n[ \t]*)?|\n[ \t]*)("(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^)\\])*\)))?[ \t\n]*\)/;
+
+// Does `s` contain a link (inline or reference) anywhere? (marked's
+// linkInText; used while masking so a reflink label that itself contains
+// a link keeps its inner structure instead of being blanked wholesale.)
+function linkInText(s, links) {
+  if (!s.includes('[')) return false;
+  for (const m of s.matchAll(RE_MASK_BLOCKSKIP)) {
+    if (RE_LINK_TEST.test(m[0]) && s.charAt(m.index - 1) !== '!') return true;
   }
-  // Merge adjacent plain text nodes left over from trimming.
-  for (let k = 1; k < nodes.length; k++) {
-    const a = nodes[k - 1];
-    const b = nodes[k];
-    if (a.type === 'text' && b.type === 'text' && !a.tokens && !b.tokens && !a._delim && !b._delim) {
-      a.text += b.text;
-      a.raw += b.raw;
-      nodes.splice(k, 1);
-      k--;
-    }
+  for (const m of s.matchAll(RE_MASK_REFLINK_SEARCH)) {
+    const r = m[0];
+    const o = r.lastIndexOf('[');
+    if (!(r.charAt(0) === '!' || !Object.hasOwn(links, normalizeLabel(r.slice(o + 1, -1)))) &&
+        !(o > 1 && linkInText(r.slice(1, o - 1), links))) return true;
   }
+  return false;
 }
 
-// The inline parser: one left-to-right scan.
-function parseInline(src, lexer) {
+// The masked source for eager emphasis: reflinks that resolve are
+// blanked (or only their ref part, when the label itself holds a link),
+// `\punct` escapes are blanked, and links / code spans / HTML are
+// blanked — all length-preserving, so indexes still line up with `src`.
+function maskForEmStrong(src, links) {
+  let t = src;
+  if (src.includes('[') && Object.keys(links).length > 0) {
+    const maskReflink = (r) => {
+      const o = r.lastIndexOf('[');
+      if (!Object.hasOwn(links, normalizeLabel(r.slice(o + 1, -1)))) return r;
+      if (o > 1 && r.charAt(0) !== '!') {
+        const inner = r.slice(1, o - 1);
+        if (linkInText(inner, links)) {
+          return '[' + inner.replace(RE_MASK_REFLINK_SEARCH, maskReflink) + '][' + 'a'.repeat(r.length - o - 2) + ']';
+        }
+      }
+      return '[' + 'a'.repeat(r.length - 2) + ']';
+    };
+    t = t.replace(RE_MASK_REFLINK_SEARCH, maskReflink);
+  }
+  // Both masking passes only match on backticks, backslashes, `[`
+  // or `<`: skip the regex scans entirely when none are present.
+  if (src.includes('`') || src.includes('\\')) {
+    t = t.replace(RE_MASK_ANY_PUNCT, (n, s, r) =>
+      r ? '+'.repeat(n.length) : s ? s + n.slice(s.length, -s.length).replace(/`/g, '+') + s : n);
+  }
+  if (src.includes('[') || src.includes('`') || src.includes('<')) {
+    t = t.replace(RE_MASK_BLOCKSKIP, (n, s, r) => {
+      const o = r ? r.length : 0;
+      return n.slice(0, o) + '[' + 'a'.repeat(n.length - o - 2) + ']';
+    });
+  }
+  return t;
+}
+
+// Last positions in the masked source where a closer run can start
+// (marked's `fe`): a run at index 0 never counts, and a run counts
+// only when the character before it is not space/tab/newline/CR/FF.
+function lastPossibleClosers(masked) {
+  const em = { '*': -1, '_': -1 };
+  let del = -1;
+  const n = masked.length;
+  for (let s = 0; s < n; s++) {
+    const r = masked[s];
+    if (r !== '*' && r !== '_' && r !== '~') continue;
+    const o = s === 0 ? '\n' : masked[s - 1];
+    let j = s + 1;
+    for (; j < n && masked[j] === r;) j++;
+    if (o !== ' ' && o !== '\t' && o !== '\n' && o !== '\r' && o !== '\f') {
+      if (r === '~') del = s;
+      else em[r] = s;
+    }
+    s = j - 1;
+  }
+  return { em, del };
+}
+
+// Try to form an em/strong node from a `*`/`_` run at `src[i]`
+// (marked's emStrong). `masked` is the full masked source, `closers`
+// its last-possible-closer indexes, `prevCh` the character before the
+// run in marked's sense. Returns the node or null.
+function tryEmStrong(src, masked, closers, i, prevCh, lexer) {
+  RE_EM_LDELIM_STICKY.lastIndex = i;
+  let s = RE_EM_LDELIM_STICKY.exec(src);
+  if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return null;
+  const r = s[0][0];
+  const o = prevCh === r;
+  let l = i;
+  while (l > 0 && masked[l - 1] === r) l--;
+  // The last code point before the run (an astral char counts once).
+  let p = '';
+  if (l > 0) {
+    const lc = masked.charCodeAt(l - 1);
+    p = (l >= 2 && lc >= 0xDC00 && lc <= 0xDFFF && masked.charCodeAt(l - 2) >= 0xD800 && masked.charCodeAt(l - 2) <= 0xDBFF)
+      ? masked.slice(l - 2, l) : masked[l - 1];
+  }
+  const h = p === '*' || p === '_' || !!RE_EM_PUNCT_OR_SPACE.exec(p);
+  let n = prevCh;
+  if (l < i) n = p;
+  const u = l < i ? h : !!RE_EM_PUNCT_OR_SPACE.exec(n);
+  if (s[4] && n.match(RE_ALPHA_NUM)) return null;
+  const d = s[1] || s[3] || '';
+  if (!d || !n || u) {
+    // `k` is the opener run length — except it is run-1 when the LDelim
+    // match consumed no following character (marked quirk, keep it).
+    // Code-point length of the LDelim match minus 1: s[0] is the run
+    // (ASCII) plus at most one following char; an astral one counts
+    // once, so subtract one more when it ends in a surrogate pair.
+    let k = s[0].length - 1;
+    if (k > 0) {
+      const lc = s[0].charCodeAt(s[0].length - 1);
+      if (lc >= 0xDC00 && lc <= 0xDFFF && s[0].charCodeAt(s[0].length - 2) >= 0xD800 && s[0].charCodeAt(s[0].length - 2) <= 0xDBFF) k--;
+    }
+    let g, b;
+    let m = k;
+    let f = 0;
+    const y = i - l + k;
+    const R = !!p.trim() && (!!d || (r === '*' && !h));
+    if (r !== '*' && r !== '_') return null;
+    const A = r === '*' ? RE_EM_RDELIM_AST : RE_EM_RDELIM_UND;
+    const v = closers.em[r];
+    const Q = i + k;
+    if (v < Q) return null;
+    const t = masked.slice(i + k);
+    const ee = v - Q;
+    for (A.lastIndex = 0; (s = A.exec(t)) !== null && !(s.index > ee);) {
+      g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6];
+      if (!g) continue;
+      b = g.length; // g is a run of `*`/`_` only (ASCII)
+      if (s[3] || s[4]) { m += b; continue; }
+      if (s[5] || s[6] || R) {
+        if (o && (s[5] || s[6])) break;
+        if (y % 3 && !((y + b) % 3)) { f += b; continue; }
+      }
+      m -= b;
+      if (m > 0) continue;
+      b = Math.min(b, b + m + f);
+      const te = s[0].codePointAt(0) > 0xFFFF ? 2 : 1; // first code point's UTF-16 length
+      const M = src.slice(i, i + k + s.index + te + b);
+      if (Math.min(k, b) % 2) {
+        const U = M.slice(1, -1);
+        return { type: 'em', raw: M, text: U, tokens: parseInline(U, lexer, true) };
+      }
+      const ne = M.slice(2, -2);
+      return { type: 'strong', raw: M, text: ne, tokens: parseInline(ne, lexer, true) };
+    }
+  }
+  return null;
+}
+
+// Try to form a del node from a `~` run at `src[i]` (marked's del).
+// Unlike emStrong there is no rule of three, and the closer run must
+// be exactly as long as the opener.
+function tryDel(src, masked, closers, i, prevCh, lexer) {
+  RE_DEL_LDELIM_STICKY.lastIndex = i;
+  let s = RE_DEL_LDELIM_STICKY.exec(src);
+  if (!s) return null;
+  if (!(s[1] || '') || !prevCh || RE_EM_PUNCT_OR_SPACE.exec(prevCh)) {
+    let o = s[0].length - 1;
+    if (o > 0) {
+      const lc = s[0].charCodeAt(s[0].length - 1);
+      if (lc >= 0xDC00 && lc <= 0xDFFF && s[0].charCodeAt(s[0].length - 2) >= 0xD800 && s[0].charCodeAt(s[0].length - 2) <= 0xDBFF) o--;
+    }
+    let p = o;
+    const h = RE_DEL_RDELIM;
+    const u = closers.del;
+    const d = i + o;
+    if (u < d) return null;
+    const t = masked.slice(i + o);
+    const kk = u - d;
+    let g, l;
+    for (h.lastIndex = 0; (s = h.exec(t)) !== null && !(s.index > kk);) {
+      g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6];
+      if (!g) continue;
+      l = g.length; // g is a run of `~` only (ASCII)
+      if (l !== o) continue;
+      if (s[3] || s[4]) { p += l; continue; }
+      p -= l;
+      if (p > 0) continue;
+      l = Math.min(l, l + p);
+      const gg = s[0].codePointAt(0) > 0xFFFF ? 2 : 1;
+      const b = src.slice(i, i + o + s.index + gg + l);
+      const m = b.slice(o, -o);
+      return { type: 'del', raw: b, text: m, tokens: parseInline(m, lexer, true) };
+    }
+  }
+  return null;
+}
+
+// The inline parser: one left-to-right scan. Emphasis/strong/del use
+// marked's eager forward scan (tryEmStrong/tryDel on a masked source);
+// the scan's "previous character" is marked's `r`: the last character
+// of the preceding text token, or '' after any non-text token — and a
+// text run ending in `_` leaves it unchanged, so `prevCh` tracks the
+// last non-`_` character of the current text run (or the value from
+// before the run started when the run is all `_`s).
+function parseInline(src, lexer, inner = false) {
   const links = lexer.links;
   const state = lexer.state;
-  state.inRawBlock = false;
+  if (!inner) state.inRawBlock = false;
   const nodes = [];
-  const delims = [];
+  let masked = null;
+  let closers = null;
   let i = 0;
   const n = src.length;
   let textStart = 0;
+  let basePrevCh = ''; // prevCh as of textStart
   let skipImageAt = -1; // a `[` already tried (and failed) as an image
+
+  function curPrev() {
+    let j = i - 1;
+    while (j >= textStart && src[j] === '_') j--;
+    if (j >= textStart) return src[j];
+    return basePrevCh;
+  }
+
+  function getMasked() {
+    if (masked === null) {
+      masked = maskForEmStrong(src, links);
+      closers = lastPossibleClosers(masked);
+    }
+    return masked;
+  }
 
   function flushText(upto) {
     if (upto <= textStart) { textStart = upto; return; }
     let t = src.slice(textStart, upto);
+    for (let k = t.length - 1; k >= 0; k--) {
+      if (t[k] !== '_') { basePrevCh = t[k]; break; }
+    }
     if (!state.inRawBlock) t = decodeEntities(t);
     const last = nodes[nodes.length - 1];
-    if (last && last.type === 'text' && !last.tokens && !last._delim) {
+    if (last && last.type === 'text' && !last.tokens) {
       last.text += t;
       last.raw += t;
     } else {
@@ -1125,42 +1485,96 @@ function parseInline(src, lexer) {
     textStart = upto;
   }
 
-  function pushDelim(char, runStart, runLen) {
-    flushText(runStart);
-    const before = runStart === 0 ? '\n' : src[runStart - 1];
-    const after = runStart + runLen >= n ? '\n' : src[runStart + runLen];
-    const punct = char === '~' ? (c) => c !== '~' && isPunct(c) : isPunct;
-    const f = flanking(before, after, punct);
-    const node = { type: 'text', raw: src.slice(runStart, runStart + runLen), text: src.slice(runStart, runStart + runLen), _delim: true };
-    nodes.push(node);
-    if (char === '~' && runLen > 2) {
-      // Runs of 3+ tildes are never strikethrough delimiters.
-      node._delim = false;
-    } else {
-      delims.push({ char, len: runLen, canOpen: canOpenDelim(char, f), canClose: canCloseDelim(char, f), node, active: true });
-    }
-    textStart = runStart + runLen;
+  // Match a GFM extended-autolink email starting at `pos` in `src`.
+  // Returns the matched text or null. With eager emphasis, an enclosing
+  // `_..._` span is consumed before the email is ever seen (its content
+  // is tokenized recursively), so the strict marked email regex is all
+  // that's needed here — compared against the maximal match only.
+  // Sticky regexes: no slicing, the match is anchored at `pos`.
+  function matchEmailAt(pos) {
+    RE_EMAIL_NOLOOK_STICKY.lastIndex = pos;
+    const full = RE_EMAIL_NOLOOK_STICKY.exec(src);
+    if (!full) return null;
+    RE_URL_EMAIL_STICKY.lastIndex = pos;
+    const strict = RE_URL_EMAIL_STICKY.exec(src);
+    if (strict && strict[0].length === full[0].length) return strict[0];
+    return strict ? strict[0] : null;
   }
 
-  // Match a GFM extended-autolink email at the start of `sub`.
-  // Returns the matched text or null. marked consumes an enclosing
-  // emphasis span before it ever sees the email, so a trailing `_` that
-  // closes an open emphasis must not cut the domain short the way the
-  // (?![\w-]) lookahead otherwise would (e.g. `_a@b.co_` links the whole
-  // address, while a bare `a@b.co_` links only `a@b`).
-  function matchEmail(sub) {
-    const full = RE_EMAIL_NOLOOK.exec(sub);
-    if (!full) return null;
-    const strict = RE_URL_EMAIL.exec(sub);
-    if (strict && strict[0].length === full[0].length) return strict[0];
-    const after = sub[full[0].length];
-    if (after !== '_') return strict ? strict[0] : null;
-    let k = full[0].length;
-    while (k < sub.length && sub[k] === '_') k++;
-    const f = flanking(full[0][full[0].length - 1], k >= sub.length ? '\n' : sub[k], isPunct);
-    if (!canCloseDelim('_', f)) return strict ? strict[0] : null;
-    for (const d of delims) if (d.active && d.char === '_' && d.canOpen) return full[0];
-    return strict ? strict[0] : null;
+  // Is `www.` at `pos` reachable the way marked's text regex would
+  // leave it reachable? At a token boundary (pending text empty), after
+  // whitespace or `*`/`_`/`~`/`(`, or where the text chunk ends for
+  // email reasons (`[local]+@` follows the position).
+  function wwwReachable(pos) {
+    if (pos === textStart) return true;
+    const prev = src[pos - 1];
+    if (prev === undefined) return true;
+    if (isSpace(prev) || prev === '*' || prev === '_' || prev === '~' || prev === '(') return true;
+    let j = pos;
+    while (j < n && RE_TEXT_LOCAL.test(src[j])) j++;
+    return j > pos && src[j] === '@';
+  }
+
+  // GFM extended autolink at position `pos`: www / scheme / email.
+  // Returns {node, end} or null. No slicing: www/scheme/email are
+  // matched with sticky regexes anchored at `pos`, and the email is
+  // only attempted where one can start (previous char outside the
+  // email local-part set — otherwise the match would start earlier,
+  // and that earlier position was already tried).
+  function tryUrlAt(pos) {
+    const ch = src[pos];
+    let m = null;
+    let kind = null;
+    let text = null;
+    if (ch === 'w' && src.startsWith('www.', pos) && wwwReachable(pos)) {
+      RE_WWW_STICKY.lastIndex = pos;
+      m = RE_WWW_STICKY.exec(src);
+      if (m) { kind = 'www'; text = m[0]; }
+    } else if (ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F') {
+      RE_HTTP_STICKY.lastIndex = pos;
+      m = RE_HTTP_STICKY.exec(src);
+      if (m) { kind = 'scheme'; text = m[0]; }
+    }
+    if (!m) {
+      const prev = pos > textStart ? src[pos - 1] : basePrevCh;
+      if (prev === '' || !isEmailLocalNarrow(prev)) {
+        const emText = matchEmailAt(pos);
+        if (emText) {
+          m = { 0: emText };
+          kind = 'email';
+          text = emText;
+        } else if (src.startsWith('xmpp:', pos) || src.startsWith('mailto:', pos)) {
+          const proto = src.startsWith('xmpp:', pos) ? 'xmpp:' : 'mailto:';
+          const em2 = matchEmailAt(pos + proto.length);
+          if (em2) {
+            let t = proto + em2;
+            if (proto === 'xmpp:') {
+              RE_XMPP_PATH_STICKY.lastIndex = pos + t.length;
+              const path = RE_XMPP_PATH_STICKY.exec(src);
+              if (path) t += path[0];
+            }
+            m = { 0: t };
+            kind = 'protocol-email';
+            text = t;
+          }
+        }
+      }
+    }
+    if (!m) return null;
+    // Backpedal trailing punctuation / unbalanced parens / entities.
+    let url = text;
+    let prev;
+    do {
+      prev = url;
+      const bp = RE_URL_BACKPEDAL.exec(url);
+      url = bp ? bp[0] : '';
+    } while (url !== prev);
+    if (url.length === 0) return null;
+    const href = kind === 'www' ? 'http://' + url : kind === 'email' ? 'mailto:' + url : url;
+    return {
+      node: { type: 'link', raw: url, text: url, href, title: null, autolink: true, tokens: [{ type: 'text', raw: url, text: url }] },
+      end: pos + url.length,
+    };
   }
 
   while (i < n) {
@@ -1178,6 +1592,7 @@ function parseInline(src, lexer) {
           i += 2;
           while (i < n && (src[i] === ' ' || src[i] === '\t')) i++;
           textStart = i;
+          basePrevCh = '';
           continue;
         }
         i++;
@@ -1188,6 +1603,7 @@ function parseInline(src, lexer) {
         nodes.push({ type: 'escape', raw: src.slice(i, i + 2), text: nxt });
         i += 2;
         textStart = i;
+        basePrevCh = '';
         continue;
       }
       i++;
@@ -1215,17 +1631,41 @@ function parseInline(src, lexer) {
         nodes.push({ type: 'codespan', raw: src.slice(i, close), text: content });
         i = close;
         textStart = i;
+        basePrevCh = '';
         continue;
       }
       i = k;
       continue;
     }
-    // Emphasis / strikethrough delimiter run.
+    // Emphasis / strikethrough delimiter run (eager, marked-style:
+    // try to open a span here; on failure fall through to url at this
+    // same position — an email can start with `_`, e.g. `_a@b.co` —
+    // else consume one literal delimiter character and retry).
     if (ch === '*' || ch === '_' || ch === '~') {
-      let k = i;
-      while (k < n && src[k] === ch) k++;
-      pushDelim(ch, i, k - i);
-      i = k;
+      const prev = curPrev();
+      let res = null;
+      if (ch === '~') res = tryDel(src, getMasked(), closers, i, prev, lexer);
+      else res = tryEmStrong(src, getMasked(), closers, i, prev, lexer);
+      if (res) {
+        flushText(i);
+        nodes.push(res);
+        i += res.raw.length;
+        textStart = i;
+        basePrevCh = '';
+        continue;
+      }
+      if (!state.inLink) {
+        const urlRes = tryUrlAt(i);
+        if (urlRes) {
+          flushText(i);
+          nodes.push(urlRes.node);
+          i = urlRes.end;
+          textStart = i;
+          basePrevCh = '';
+          continue;
+        }
+      }
+      i++;
       continue;
     }
     // Link / image. An escaped `!` does not make an image.
@@ -1242,6 +1682,7 @@ function parseInline(src, lexer) {
         nodes.push(res.node);
         i = res.end;
         textStart = i;
+        basePrevCh = '';
         continue;
       }
       if (res && res.literal) {
@@ -1251,6 +1692,7 @@ function parseInline(src, lexer) {
           flushText(i - 1);
           nodes.push({ type: 'text', raw: '!', text: '!' });
           textStart = i;
+          basePrevCh = '!';
           skipImageAt = i;
           continue;
         }
@@ -1258,6 +1700,7 @@ function parseInline(src, lexer) {
         nodes.push({ type: 'text', raw: '[', text: '[' });
         i += 1;
         textStart = i;
+        basePrevCh = '[';
         continue;
       }
       i++;
@@ -1275,6 +1718,7 @@ function parseInline(src, lexer) {
         nodes.push({ type: 'link', raw: auto[0], text: addr, href, title: null, autolink: true, tokens: [{ type: 'text', raw: addr, text: addr }] });
         i += auto[0].length;
         textStart = i;
+        basePrevCh = '';
         continue;
       }
       const tag = RE_INLINE_TAG.exec(sub);
@@ -1287,6 +1731,7 @@ function parseInline(src, lexer) {
         nodes.push({ type: 'html', raw: tag[0], text: tag[0], block: false, inLink: state.inLink, inRawBlock: state.inRawBlock });
         i += tag[0].length;
         textStart = i;
+        basePrevCh = '';
         continue;
       }
       i++;
@@ -1304,6 +1749,7 @@ function parseInline(src, lexer) {
         i += 1;
         while (i < n && (src[i] === ' ' || src[i] === '\t')) i++;
         textStart = i;
+        basePrevCh = '';
         continue;
       }
       i++;
@@ -1311,57 +1757,22 @@ function parseInline(src, lexer) {
     }
     // GFM extended autolinks (not inside a link).
     if (!state.inLink && (ch === 'w' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || RE_EMAIL_LOCAL.test(ch))) {
-      const sub = src.slice(i);
-      let m = null;
-      let kind = null;
-      let text = null;
-      if (ch === 'w' && sub.startsWith('www.') && (i === 0 || ' \t\n*_~('.includes(src[i - 1]))) {
-        m = /^(www\.(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*)/.exec(sub);
-        if (m) { kind = 'www'; text = m[0]; }
-      } else if (RE_SCHEME.test(sub)) {
-        m = /^((?:[hH][tT][tT][pP][sS]?|[fF][tT][pP]):\/\/(?:[a-zA-Z0-9\-]+\.?)+[^\s<]*)/.exec(sub);
-        if (m) { kind = 'scheme'; text = m[0]; }
-      }
-      if (!m) {
-        // Plain email: no preceding-character check (marked has none:
-        // `x@y@z.com` links `y@z.com`).
-        const emText = matchEmail(sub);
-        if (emText) {
-          m = { 0: emText };
-          kind = 'email';
-          text = emText;
-        } else if (sub.startsWith('xmpp:') || sub.startsWith('mailto:')) {
-          const proto = sub.startsWith('xmpp:') ? 'xmpp:' : 'mailto:';
-          const em2 = matchEmail(sub.slice(proto.length));
-          if (em2) {
-            let t = proto + em2;
-            if (proto === 'xmpp:') {
-              const path = /^\/[A-Za-z0-9@.]+/.exec(sub.slice(t.length));
-              if (path) t += path[0];
-            }
-            m = { 0: t };
-            kind = 'protocol-email';
-            text = t;
-          }
-        }
-      }
-      if (m) {
-        // Backpedal trailing punctuation / unbalanced parens / entities.
-        let url = text;
-        let prev;
-        do {
-          prev = url;
-          const bp = RE_URL_BACKPEDAL.exec(url);
-          url = bp ? bp[0] : '';
-        } while (url !== prev);
-        if (url.length > 0) {
-          flushText(i);
-          const href = kind === 'www' ? 'http://' + url : kind === 'email' ? 'mailto:' + url : url;
-          nodes.push({ type: 'link', raw: url, text: url, href, title: null, autolink: true, tokens: [{ type: 'text', raw: url, text: url }] });
-          i += url.length;
-          textStart = i;
-          continue;
-        }
+      // Only a URL/email can start here: www./scheme need w/h/f, an
+      // email needs the previous char outside the local-part set, and
+      // xmpp:/mailto: need it non-alphanumeric (marked's text rule only
+      // stops before a protocol after a non-alnum char).
+      const prev = i > textStart ? src[i - 1] : basePrevCh;
+      const maybeUrl = ch === 'w' || ch === 'h' || ch === 'H' || ch === 'f' || ch === 'F'
+        || prev === '' || !isEmailLocalNarrow(prev)
+        || ((ch === 'x' || ch === 'm') && !isAlnumCh(prev));
+      const urlRes = maybeUrl ? tryUrlAt(i) : null;
+      if (urlRes) {
+        flushText(i);
+        nodes.push(urlRes.node);
+        i = urlRes.end;
+        textStart = i;
+        basePrevCh = '';
+        continue;
       }
       i++;
       continue;
@@ -1369,7 +1780,6 @@ function parseInline(src, lexer) {
     i++;
   }
   flushText(n);
-  processEmphasis(nodes, delims);
   return nodes;
 }
 
